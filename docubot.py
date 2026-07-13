@@ -9,8 +9,24 @@ Core DocuBot class responsible for:
 
 import os
 import glob
+import re
 
 class DocuBot:
+    # Minimum fraction of the query's distinct words that must show up in the
+    # retrieved sections before we treat that as "meaningful evidence."
+    # Below this, a nonzero score is likely just one incidental word overlap
+    # (e.g. a common word like "is") rather than an actual answer to the query.
+    MIN_QUERY_COVERAGE = 0.5
+
+    # Common words carrying no real topical signal. Excluded from coverage
+    # so a query like "is the database nice" can't pass just because "is"
+    # and "the" appear in nearly every document.
+    STOPWORDS = {
+        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+        "of", "in", "on", "at", "to", "for", "and", "or", "but", "with",
+        "do", "does", "did", "how", "what", "which", "who", "this", "that",
+    }
+
     def __init__(self, docs_folder="docs", llm_client=None):
         """
         docs_folder: directory containing project documentation files
@@ -21,6 +37,10 @@ class DocuBot:
 
         # Load documents into memory
         self.documents = self.load_documents()  # List of (filename, text)
+
+        # Split documents into smaller newline-separated sections so
+        # retrieval can return a relevant paragraph instead of a whole file
+        self.sections = self.build_sections(self.documents)  # List of (filename, section_text)
 
         # Build a retrieval index (implemented in Phase 1)
         self.index = self.build_index(self.documents)
@@ -45,26 +65,74 @@ class DocuBot:
         return docs
 
     # -----------------------------------------------------------
+    # Section Splitting
+    # -----------------------------------------------------------
+
+    def _is_heading_only(self, section):
+        """True if every line in the section is a markdown heading (starts with '#')."""
+        lines = section.splitlines()
+        return bool(lines) and all(line.strip().startswith("#") for line in lines)
+
+    def _split_into_sections(self, text):
+        """
+        Split a document's text into paragraph-sized sections, separated by
+        one or more blank lines. Empty sections (extra blank lines) are dropped.
+
+        A section that is only a markdown heading (e.g. "### GET /api/users")
+        is glued to the section(s) that follow it, up through the first body
+        paragraph. Otherwise a heading and the text describing it end up in
+        separate sections, and retrieval can return the description without
+        ever mentioning what it's describing.
+        """
+        raw_sections = re.split(r"\n\s*\n", text)
+        raw_sections = [section.strip() for section in raw_sections if section.strip()]
+
+        sections = []
+        i = 0
+        while i < len(raw_sections):
+            section = raw_sections[i]
+            i += 1
+            while self._is_heading_only(section) and i < len(raw_sections):
+                section = section + "\n" + raw_sections[i]
+                i += 1
+            sections.append(section)
+
+        return sections
+
+    def build_sections(self, documents):
+        """
+        Flatten each document into its individual sections.
+        Returns a list of (filename, section_text) tuples, one per section.
+        """
+        sections = []
+        for filename, text in documents:
+            for section in self._split_into_sections(text):
+                sections.append((filename, section))
+        return sections
+
+    # -----------------------------------------------------------
     # Index Construction (Phase 1)
     # -----------------------------------------------------------
 
+    def _tokenize(self, text):
+        """Lowercase word tokens, punctuation stripped."""
+        return re.findall(r"[a-z0-9]+", text.lower())
+
     def build_index(self, documents):
         """
-        TODO (Phase 1):
-        Build a tiny inverted index mapping lowercase words to the documents
-        they appear in.
+        Build a tiny inverted index mapping lowercase words to the filenames
+        of the documents they appear in.
 
         Example structure:
         {
             "token": ["AUTH.md", "API_REFERENCE.md"],
             "database": ["DATABASE.md"]
         }
-
-        Keep this simple: split on whitespace, lowercase tokens,
-        ignore punctuation if needed.
         """
         index = {}
-        # TODO: implement simple indexing
+        for filename, text in documents:
+            for token in set(self._tokenize(text)):
+                index.setdefault(token, []).append(filename)
         return index
 
     # -----------------------------------------------------------
@@ -73,27 +141,63 @@ class DocuBot:
 
     def score_document(self, query, text):
         """
-        TODO (Phase 1):
-        Return a simple relevance score for how well the text matches the query.
-
-        Suggested baseline:
-        - Convert query into lowercase words
-        - Count how many appear in the text
-        - Return the count as the score
+        Return a simple relevance score for how well the text matches the query:
+        the number of query word occurrences found in the text.
         """
-        # TODO: implement scoring
-        return 0
+        query_words = self._tokenize(query)
+        text_words = self._tokenize(text)
+        return sum(text_words.count(word) for word in query_words)
 
     def retrieve(self, query, top_k=3):
         """
-        TODO (Phase 1):
-        Use the index and scoring function to select top_k relevant document snippets.
-
-        Return a list of (filename, text) sorted by score descending.
+        Score every section against the query and return the top_k
+        (filename, section_text) pairs sorted by score descending. Sections
+        that score 0 are excluded.
         """
-        results = []
-        # TODO: implement retrieval logic
+        scored = []
+        for filename, section in self.sections:
+            score = self.score_document(query, section)
+            if score > 0:
+                scored.append((score, filename, section))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        results = [(filename, section) for _, filename, section in scored]
         return results[:top_k]
+
+    # -----------------------------------------------------------
+    # Evidence Guardrail
+    # -----------------------------------------------------------
+
+    def _content_words(self, text):
+        """Tokenize text and drop stopwords, leaving only topical words."""
+        return {word for word in self._tokenize(text) if word not in self.STOPWORDS}
+
+    def _has_sufficient_evidence(self, query, snippets):
+        """
+        Decide whether retrieved snippets are real evidence for the query,
+        rather than an incidental keyword overlap.
+
+        Checks, in order:
+        1. There are no snippets at all (retrieval found nothing).
+        2. The query has no content words to match on (e.g. empty,
+           punctuation-only, or made only of stopwords like "is the a"),
+           so nothing meaningful could count as evidence.
+        3. The snippets collectively cover at least MIN_QUERY_COVERAGE of the
+           query's distinct content words. Matching one word out of many is
+           not enough to be confident.
+        """
+        if not snippets:
+            return False
+
+        query_words = self._content_words(query)
+        if not query_words:
+            return False
+
+        combined_text = " ".join(text for _, text in snippets)
+        matched_words = query_words & self._content_words(combined_text)
+        coverage = len(matched_words) / len(query_words)
+
+        return coverage >= self.MIN_QUERY_COVERAGE
 
     # -----------------------------------------------------------
     # Answering Modes
@@ -106,7 +210,7 @@ class DocuBot:
         """
         snippets = self.retrieve(query, top_k=top_k)
 
-        if not snippets:
+        if not self._has_sufficient_evidence(query, snippets):
             return "I do not know based on these docs."
 
         formatted = []
@@ -128,7 +232,7 @@ class DocuBot:
 
         snippets = self.retrieve(query, top_k=top_k)
 
-        if not snippets:
+        if not self._has_sufficient_evidence(query, snippets):
             return "I do not know based on these docs."
 
         return self.llm_client.answer_from_snippets(query, snippets)
