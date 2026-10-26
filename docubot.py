@@ -142,11 +142,15 @@ class DocuBot:
     def score_document(self, query, text):
         """
         Return a simple relevance score for how well the text matches the query:
-        the number of query word occurrences found in the text.
+        distinct content words matched (weighted heavily) plus total
+        occurrences (tiebreaker), so covering more of the query beats
+        repeating one word many times.
         """
-        query_words = self._tokenize(query)
+        query_words = self._content_words(query)
         text_words = self._tokenize(text)
-        return sum(text_words.count(word) for word in query_words)
+        distinct = sum(1 for word in query_words if word in text_words)
+        occurrences = sum(text_words.count(word) for word in query_words)
+        return distinct * 100 + occurrences
 
     def retrieve(self, query, top_k=3):
         """

@@ -37,7 +37,7 @@ Describe your choices for indexing and scoring.
 - How do you score relevance for a query?
 - How do you choose top snippets?
 
-> _The retrieval system works by reading each file as a whole then utilizing a method to split each document into blank-line delimited paragraphs.  The scoring works by tokenizing both query and text then summing how many times each query word occurs within the text inputted. The snippets are retrieved based on the scores and it will drop zero-scores then sort in descending order._
+> _The retrieval system works by reading each file as a whole then utilizing a method to split each document into blank-line delimited paragraphs.  The scoring works by tokenizing both query and text, dropping stopwords from the query, then scoring each section as 100 x the number of distinct query words it contains plus the total occurrences (so covering more of the query beats repeating one word). The snippets are retrieved based on the scores and it will drop zero-scores then sort in descending order._
 
 **What tradeoffs did you make?**  
 For example: speed vs precision, simplicity vs accuracy.
@@ -70,12 +70,28 @@ Run the **same set of queries** in all three modes. Fill in the table with short
 
 You can reuse or adapt the queries from `dataset.py`.
 
-| Where is the auth token generated? | Naive LLM: harmful | Retrieval only: harmful | RAG: harmful | Notes |
-|For mode 1 we receive generic responses. For mode 2 we receive generitc connection details too. For mode 3 we receive API conventions linked that do not exist in this repo.|---------------------------------|--------------------------------------|---------------------------|-------|
-| Example: Where is the auth token generated? | | | | |
-| Example: How do I connect to the database? | | | | |
-| Example: Which endpoint lists all users? | | | | |
-| Example: How does a client refresh an access token? | | | | |
+| Question | Naive LLM (Mode 1) | Retrieval only (Mode 2) | RAG (Mode 3) | Notes |
+|---|---|---|---|---|
+| Where is the auth token generated? | Asks for more context, then lists generic places tokens live (`auth.service.js`, `generateToken()`...). Nothing about this repo. | Correct: the `## Token Generation` section ranks first (`generate_access_token` in `auth_utils.py`), followed by two related AUTH.md snippets. | Correct and short: `generate_access_token` in `auth_utils.py`, cites AUTH.md. | RAG is the easiest to trust: same evidence as Mode 2, but as one cited sentence. |
+| How do I connect to the database? | Generic "which DB/framework?" plus boilerplate `.env` advice. | "I do not know based on these docs." | "I do not know based on these docs." | Docs do cover this (DATABASE.md, SETUP.md `DATABASE_URL`). Both grounded modes wrongly refuse because the query says "connect" and the docs say "connection". |
+| Which endpoint lists all users? | Lists GitHub, Slack, Okta, Auth0 endpoints and `GET /users`. None are this project's. | Correct: `### GET /api/users` ranks first, then `get_all_users()` and an API_REFERENCE intro. | Correct: "`GET /api/users`", cites API_REFERENCE.md. | Mode 1 is fluent but would send a developer to an endpoint that does not exist here. |
+| How does a client refresh an access token? | Full OAuth2 `refresh_token` grant walkthrough (`POST /oauth/token`, `client_secret`...). The docs describe `POST /api/refresh` instead. | Returns 3 snippets, none mention `/api/refresh` (Token Generation, validation list, a JSON example). | "I do not know based on the docs I have." | The docs do answer this (AUTH.md line 57, API_REFERENCE.md `POST /api/refresh`). Retrieval missed it, so RAG refused. |
+| What is the best pizza topping? (off-topic) | Confidently answers with a "Pizza Topping Selection Guide". | "I do not know based on these docs." | "I do not know based on these docs." | Only the grounded modes refuse. Mode 3's refusal comes from the retrieval guardrail, so the LLM is never called. |
+
+**Evidence each mode uses and when it should refuse**
+
+- Mode 1 (naive): uses no project evidence at all. The prompt ignores `all_text`, so it answers from general training data and never refuses.
+- Mode 2 (retrieval only): uses the top 3 paragraph-sized sections, and refuses when the coverage guardrail fails (see section 5).
+- Mode 3 (RAG): uses the same top 3 sections, so the guardrail runs first. The LLM then gets only those snippets plus the rule to reply "I do not know" if they are not enough. It should refuse when retrieval is empty or weak, or when the snippets don't actually contain the answer.
+
+Note: Mode 1 and Mode 3 calls sometimes hit Gemini free-tier limits (429 at 5 requests/min, 503 under load). Those were re-run, not counted as answers.
+
+**Example of each behavior requested**
+
+- Naive generation, confident but weakly grounded: "Which endpoint lists all users?" and "How does a client refresh an access token?" Both answers sound authoritative and are wrong for this repo.
+- Retrieval only, accurate but hard to read: "Where is the auth token generated?" returns three raw markdown snippets, and the user has to find the one sentence that answers it.
+- RAG combining clarity and evidence: "Which endpoint lists all users?" gives one sentence naming `GET /api/users` and citing API_REFERENCE.md.
+- RAG still failing: "How does a client refresh an access token?" The docs contain `/api/refresh`, but retrieval ranked other token sections higher, so the LLM only saw irrelevant snippets and correctly refused given what it was shown. The pipeline was wrong, not the LLM.
 
 **What patterns did you notice?**  
 
@@ -84,6 +100,8 @@ You can reuse or adapt the queries from `dataset.py`.
 - When is RAG clearly better than both?
 
 > _Naive mode is most impressive but untrustworthy when it substitutes real well-known API conventions. For retrieval only it is clearly better when the answer is one word for word sentence from the text. Then for mode 3 it is better than both when a question needs the retrieved fact turned into a direct cited sentence which depends on the retrieval semi working too._
+
+> _Checkpoint takeaway: Mode 3 was easiest to trust on "Which endpoint lists all users?". Mode 1 named endpoints from other products, and Mode 2 had the right answer but buried it among three snippets. An LLM needs retrieval to stay grounded in project-specific facts. Retrieval alone isn't enough when the user wants a direct answer, and RAG can't fix a retrieval miss: the refresh-token question failed in Mode 3 because the right section never reached the model._
 
 ---
 
